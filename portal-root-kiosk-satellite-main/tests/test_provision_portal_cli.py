@@ -314,7 +314,12 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             sdk = pathlib.Path(temporary) / "sdk"
             ndk = sdk / "ndk" / "28.2.13676358"
-            toolchain = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+            prebuilt = (
+                "darwin-x86_64" if sys.platform == "darwin" else "linux-x86_64"
+            )
+            toolchain = (
+                ndk / "toolchains" / "llvm" / "prebuilt" / prebuilt / "bin"
+            )
             build_tools = sdk / "build-tools" / "37.0.0"
             platform = sdk / "platforms" / "android-36"
             for path in (

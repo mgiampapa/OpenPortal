@@ -19,3 +19,22 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local tool caches / private state (never commit)
+.android/
+.cache/
+Library/
+unsloth-tmp/
+analysis.txt
+
+# Google stack APKs are downloaded by hand; only the placeholder is committed
+stack/*.apk
+stack/*.apkm
+stack/*.xapk
+
+# NDK install helper's transient downloads
+deps/ndk-parts/
+deps/android-ndk-*.zip
+
+# Auto-downloaded at runtime when adb is missing
+deps/platform-tools/

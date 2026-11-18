@@ -1,6 +1,13 @@
 include ../android-env.mk
 
-TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+# BSD stat (macOS) uses -f %z; GNU stat (Linux) uses -c %s.
+ifeq ($(HOST_TAG),Darwin)
+STAT_SIZE = stat -f %z
+else
+STAT_SIZE = stat -c %s
+endif
+
+TOOLCHAIN ?= $(TOOLCHAIN_DIR)
 CXX := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang++
 CC := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang
 OBJCOPY := $(TOOLCHAIN)/bin/llvm-objcopy
@@ -38,7 +45,7 @@ $(HOOK_OBJECT): native/boot_hook.S
 
 $(HOOK): $(HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 316
+	test "$$($(STAT_SIZE) $@)" -le 316
 
 $(ALOHA_LIBRARY): native/portal_camera_led_watch.cpp native/portal_camera_led_jni.cpp
 	mkdir -p $(BUILD)
@@ -66,7 +73,15 @@ $(ALOHA_HOOK_OBJECT): native/boot_hook_runtime.S
 
 $(ALOHA_HOOK): $(ALOHA_HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 32768
+	test "$$($(STAT_SIZE) $@)" -le 32768
+
+$(KEYSTORE):
+	mkdir -p $(dir $(KEYSTORE))
+	keytool -genkeypair -keystore $(KEYSTORE) -storepass android \
+		-alias androiddebugkey -keypass android \
+		-dname "CN=Android Debug,O=Android,C=US" \
+		-keyalg RSA -keysize 2048 -validity 10000 || test -s $(KEYSTORE)
+	chmod 0600 $(KEYSTORE)
 
 $(ALOHA_APK): AndroidManifest.xml $(ALOHA_LIBRARY) $(ALOHA_BOOTSTRAP) $(KEYSTORE)
 	rm -rf $(ALOHA_APK_STAGE) $(ALOHA_APK_UNSIGNED) $(ALOHA_APK_ALIGNED) $@

@@ -7569,7 +7569,16 @@ def android_build_environment(
         )
     ).expanduser()
     d8 = pathlib.Path(environment.get("D8", str(build_tools / "d8"))).expanduser()
-    toolchain_bin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    # The NDK ships host-specific prebuilt directories: linux-x86_64 on Linux
+    # and darwin-x86_64 on macOS (the latter runs under Rosetta 2 on Apple
+    # Silicon). Respect an explicit NDK_PREBUILT for unusual layouts.
+    if sys.platform == "darwin":
+        ndk_prebuilt = environment.get("NDK_PREBUILT", "darwin-x86_64")
+    else:
+        ndk_prebuilt = environment.get("NDK_PREBUILT", "linux-x86_64")
+    toolchain_bin = (
+        ndk / "toolchains" / "llvm" / "prebuilt" / ndk_prebuilt / "bin"
+    )
 
     required_paths = {
         "Android NDK arm64 compiler": (

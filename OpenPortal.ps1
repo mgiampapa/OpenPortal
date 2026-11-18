@@ -69,7 +69,8 @@ param(
     [string]$Phases = "1,2,3,4,5",
     [string]$Serial = "",
     [string]$ToolRoot = "",
-    [string]$LogRoot = "$env:LOCALAPPDATA\Temp\opencode\portal-provision",
+    # Default log directory (Windows vs macOS)
+    [string]$LogRoot = "",
     [int]$Attempts = 12,
     [switch]$Rebuild,
 
@@ -90,14 +91,40 @@ param(
     # and where to look for it. Java and apksig (both auto-fetched if missing)
     # are used to read APK signing certs.
     [string]$MessengerApk = "",
-    [string]$MessengerDir = "$env:USERPROFILE\Downloads",
+    [string]$MessengerDir = "",   # defaults to the Downloads dir once platform is known
     [string]$SdkRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
+# Set platform-appropriate default log directory
+if ($IsWindows) {
+    if (-not $LogRoot) { $LogRoot = "$env:LOCALAPPDATA\Temp\opencode\portal-provision" }
+} else {
+    if (-not $LogRoot) { $LogRoot = "/tmp/opencode/portal-provision" }
+}
+
+# Detect platform
+# Use built-in platform detection variables (PowerShell 6+)
+$script:OnWindows = $IsWindows
+
+# Set appropriate extensions based on platform
+$homeDir = [Environment]::GetFolderPath("UserProfile")
+if ($script:OnWindows) {
+    $script:ExeExt = ".exe"
+    $script:PathSep = ";"
+    $script:TempDir = $env:TEMP
+    $script:DownloadsDir = "$homeDir\Downloads"
+} else {
+    $script:ExeExt = ""
+    $script:PathSep = ":"
+    $script:TempDir = "/tmp"
+    $script:DownloadsDir = "$homeDir/Downloads"
+}
+
 # Default the exploit checkout to the copy bundled next to this script.
 if (-not $ToolRoot) { $ToolRoot = Join-Path $PSScriptRoot "portal-root-kiosk-satellite-main" }
+
 
 $script:Serial = $Serial
 $script:PortalIp = $null
@@ -171,41 +198,119 @@ function Confirm-RiskWarning {
 # ---------------------------------------------------------------------------
 $script:DepsDir = Join-Path $PSScriptRoot "deps"
 
+# Temporary directory (use /tmp on macOS, %TEMP% on Windows)
+if ($script:OnWindows) {
+    $script:TempDir = "$env:TEMP"
+} else {
+    $script:TempDir = "/tmp"
+}
+
+# Downloads directory
+if ($script:OnWindows) {
+    $script:DownloadsDir = "$homeDir\Downloads"
+} else {
+    $script:DownloadsDir = "$homeDir/Downloads"
+}
+if (-not $MessengerDir) { $MessengerDir = $script:DownloadsDir }
+
 function Download-File {
     param([string]$Url, [string]$OutFile)
     New-Item -ItemType Directory -Force -Path (Split-Path $OutFile -Parent) | Out-Null
-    Write-Notice "downloading $(Split-Path $OutFile -Leaf) ..."
+    Write-Notice "downloading $(Split-Path $OutFile -Leaf)"
+    Write-Notice "  URL: $Url"
+    Write-Notice "  destination: $OutFile"
     $tmp = "$OutFile.download"
     $prev = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
-    try { Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing } finally { $ProgressPreference = $prev }
+    try { Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing }
+    finally { $ProgressPreference = $prev }
     Move-Item -LiteralPath $tmp -Destination $OutFile -Force
 }
 
 # --- find-what-already-exists helpers (return a path, or $null) ---
 
 function Get-AdbPath {
-    $cmd = Get-Command adb.exe -ErrorAction SilentlyContinue
+    # Try adb with extension first (Windows)
+    $cmd = Get-Command adb -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $local = Join-Path $script:DepsDir "platform-tools\adb.exe"
+    $local = Join-Path $script:DepsDir "platform-tools/adb"
     if (Test-Path -LiteralPath $local) { return $local }
-    foreach ($root in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, (Join-Path $env:LOCALAPPDATA "Android\Sdk"))) {
+
+    # Try adb without extension (macOS/Linux)
+    $cmd = Get-Command adb -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $local = Join-Path $script:DepsDir "platform-tools/adb"
+    if (Test-Path -LiteralPath $local) { return $local }
+
+    foreach ($root in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)) {
         if ($root) {
-            $p = Join-Path $root "platform-tools\adb.exe"
+            # Windows path
+            $p = Join-Path $root "platform-tools/adb"
+            if (Test-Path -LiteralPath $p) { return $p }
+            # macOS/Linux path
+            $p = Join-Path $root "platform-tools/adb"
             if (Test-Path -LiteralPath $p) { return $p }
         }
     }
     return $null
 }
 
+function Test-JavaWorks {
+    param([string]$JavaExe)
+    if (-not $JavaExe -or -not (Test-Path -LiteralPath $JavaExe)) { return $false }
+    # /usr/bin/java on macOS is a stub that prints "Unable to locate a Java
+    # Runtime" and exits non-zero when no JDK is registered; probe for real.
+    try {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $out = & $JavaExe -version 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        return ($code -eq 0 -and -not (($out -join ' ') -match 'Unable to locate'))
+    } catch { return $false }
+}
+
 function Get-JavaPath {
     $cands = @()
-    if ($env:JAVA_HOME) { $cands += (Join-Path $env:JAVA_HOME "bin\java.exe") }
-    $cands += @(Get-Command java.exe -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
-    $cands += @(Get-ChildItem "C:\Program Files\*\bin\java.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-    $cands += @(Get-ChildItem "C:\Program Files (x86)\*\bin\java.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    
+    # Try JAVA_HOME first
+    if ($env:JAVA_HOME) {
+        if ($script:OnWindows) {
+            $cands += (Join-Path $env:JAVA_HOME "bin\java.exe")
+        } else {
+            $cands += (Join-Path $env:JAVA_HOME "bin/java")
+        }
+    }
+    
+    # Known good JDK locations before PATH (PATH order still wins after these
+    # only if the earlier ones are broken, because we filter by Test-JavaWorks).
+    if (-not $script:OnWindows) {
+        # Homebrew openjdk is keg-only: it is NOT symlinked into /opt/homebrew/bin,
+        # and /usr/bin/java is a stub unless the JDK was registered system-wide.
+        $cands += "/opt/homebrew/opt/openjdk/bin/java"
+        $cands += "/opt/homebrew/opt/openjdk@17/bin/java"
+        $cands += "/opt/homebrew/opt/openjdk@21/bin/java"
+        $cands += "/Library/Java/JavaVirtualMachines/*/Contents/Home/bin/java"
+    }
+    
+    $cands += @(Get-Command java -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    
+    # Windows-specific locations
+    if ($script:OnWindows) {
+        $cands += @(Get-ChildItem "C:\Program Files\*\bin\java.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $cands += @(Get-ChildItem "C:\Program Files (x86)\*\bin\java.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    
     $cands += (Join-Path $script:DepsDir "jre\bin\java.exe")
-    return ($cands | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1)
+    
+    foreach ($c in $cands) {
+        if (-not $c) { continue }
+        # Expand any glob candidates (e.g. /Library/Java/JavaVirtualMachines/*)
+        $expanded = @(Resolve-Path $c -ErrorAction SilentlyContinue | ForEach-Object { $_.Path })
+        foreach ($e in @($expanded)) {
+            if (Test-JavaWorks $e) { return $e }
+        }
+    }
+    return $null
 }
 
 function Get-ApksigJar {
@@ -232,30 +337,65 @@ function Ensure-Adb {
     $adb = Get-AdbPath
     if ($adb) {
         Write-Host "adb:    $adb"
-        $env:PATH = "$(Split-Path $adb -Parent);$env:PATH"
+        $env:PATH = "$(Split-Path $adb -Parent)$script:PathSep$env:PATH"
         return
     }
-    Write-Notice "adb not found; fetching Android platform-tools ..."
+    Write-Notice "adb not found on PATH or in ANDROID_HOME/ANDROID_SDK_ROOT; downloading platform-tools..."
     $zip = Join-Path $script:DepsDir "platform-tools.zip"
-    Download-File "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" $zip
+    
+    if ($script:OnWindows) {
+        Download-File "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" $zip
+    } else {
+        # macOS/Linux version
+        Download-File "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" $zip
+    }
+    
     Expand-Archive -LiteralPath $zip -DestinationPath $script:DepsDir -Force
     Remove-Item -LiteralPath $zip -Force
     $dir = Join-Path $script:DepsDir "platform-tools"
-    if (-not (Test-Path -LiteralPath (Join-Path $dir "adb.exe"))) { throw "Could not obtain adb (platform-tools download failed)." }
-    Write-Host "adb:    $(Join-Path $dir 'adb.exe')  (downloaded)"
-    $env:PATH = "$dir;$env:PATH"
+    
+    if ($script:OnWindows) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "adb.exe"))) { throw "Could not obtain adb (platform-tools download failed)." }
+        Write-Host "adb:    $(Join-Path $dir 'adb.exe')  (downloaded)"
+    } else {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "adb"))) { throw "Could not obtain adb (platform-tools download failed)." }
+        Write-Host "adb:    $(Join-Path $dir 'adb')  (downloaded)"
+    }
+    
+    $env:PATH = "$dir$script:PathSep$env:PATH"
 }
 
 function Ensure-Java {
     $java = Get-JavaPath
     if ($java) {
         Write-Host "Java:   $java"
-        $env:PATH = "$(Split-Path $java -Parent);$env:PATH"
+        $bin = Split-Path $java -Parent
+        # Put the real JDK's bin first so javac/jar/keytool/d8/apksigner resolve
+        # to it (the build tools' wrapper scripts exec plain `java`).
+        $env:PATH = "$bin$script:PathSep$env:PATH"
+        if (-not $script:OnWindows) {
+            # Export JAVA_HOME so sdkmanager & friends find the same JDK. The
+            # keg bin dir is <keg>/bin; a real JAVA_HOME has ../release. For
+            # Homebrew openjdk the actual Home is nested deeper, so probe both.
+            $jdkHome = Split-Path $bin -Parent
+            if (-not (Test-Path -LiteralPath (Join-Path $jdkHome "release"))) {
+                $nested = Get-ChildItem -LiteralPath (Join-Path $jdkHome "libexec") -Filter "*.jdk" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($nested) { $jdkHome = Join-Path $nested.FullName "Contents/Home" }
+            }
+            if (Test-Path -LiteralPath (Join-Path $jdkHome "release")) { $env:JAVA_HOME = $jdkHome }
+        }
         return
     }
-    Write-Notice "Java not found; fetching a JRE ..."
+    Write-Notice "Java not found (checked JAVA_HOME, PATH, /opt/homebrew/opt/openjdk); downloading JRE..."
     $zip = Join-Path $script:DepsDir "jre.zip"
-    Download-File "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse" $zip
+    
+    if ($script:OnWindows) {
+        Download-File "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse" $zip
+    } else {
+        # macOS version
+        Download-File "https://api.adoptium.net/v3/binary/latest/21/ga/mac/aarch64/jre/hotspot/normal/eclipse" $zip
+    }
+    
     $tmp = Join-Path $script:DepsDir "jre-extract"
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
@@ -265,9 +405,18 @@ function Ensure-Java {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
     if ($inner) { Move-Item -LiteralPath $inner.FullName -Destination $dir -Force }
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not (Test-Path -LiteralPath (Join-Path $dir "bin\java.exe"))) { throw "Could not obtain Java (JRE download failed)." }
-    Write-Host "Java:   $(Join-Path $dir 'bin\java.exe')  (downloaded)"
-    $env:PATH = "$dir\bin;$env:PATH"
+    
+    if ($script:OnWindows) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "bin\java.exe"))) { throw "Could not obtain Java (JRE download failed)." }
+        Write-Host "Java:   $(Join-Path $dir 'bin\java.exe')  (downloaded)"
+    } else {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "bin/java"))) { throw "Could not obtain Java (JRE download failed)." }
+        Write-Host "Java:   $(Join-Path $dir 'bin/java')  (downloaded)"
+    }
+    
+    $jbin = Join-Path $dir ("bin\java.exe" | ForEach-Object { $_ })
+    if ($script:OnWindows) { $jbin = Join-Path $dir "bin\java.exe" } else { $jbin = Join-Path $dir "bin/java" }
+    $env:PATH = "$(Split-Path $jbin -Parent)$script:PathSep$env:PATH"
 }
 
 function Ensure-Apksig {
@@ -283,8 +432,16 @@ function Ensure-Apksig {
 # A Python runtime (the provisioner is a Python program; Windows has no built-in).
 function Get-PythonPath {
     $cands = @()
-    $cands += @(Get-Command python.exe -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
-    $cands += @(Get-Command python3.exe -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    
+    if ($script:OnWindows) {
+        $cands += @(Get-Command python -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+        $cands += @(Get-Command python3 -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    } else {
+        # macOS/Linux: check for python and python3 without .exe
+        $cands += @(Get-Command python3 -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+        $cands += @(Get-Command python -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    }
+    
     $cands += (Join-Path $script:DepsDir "python\python.exe")
     foreach ($c in $cands) {
         if (-not $c) { continue }
@@ -300,15 +457,27 @@ function Ensure-Python {
     $dir = Join-Path $script:DepsDir "python"
     $py = Get-PythonPath
     if (-not $py) {
-        Write-Notice "Python not found; fetching a portable Python ..."
-        $zip = Join-Path $script:DepsDir "python.zip"
-        Download-File "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip" $zip
-        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
-        Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
-        Remove-Item -LiteralPath $zip -Force
-        $py = Join-Path $dir "python.exe"
-        if (-not (Test-Path -LiteralPath $py)) { throw "Could not obtain Python." }
-        Write-Host "Python: $py  (downloaded)"
+        if ($script:OnWindows) {
+            Write-Notice "Python not found on PATH; downloading Python..."
+            $zip = Join-Path $script:DepsDir "python.zip"
+            Download-File "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip" $zip
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+            Remove-Item -LiteralPath $zip -Force
+            $py = Join-Path $dir "python.exe"
+            if (-not (Test-Path -LiteralPath $py)) { throw "Could not obtain Python." }
+            Write-Host "Python: $py  (downloaded)"
+        } else {
+            # macOS ships python3 with the Command Line Tools, and Homebrew's
+            # python3 lives in /opt/homebrew/bin. Auto-installing a .pkg from
+            # here needs admin rights and is fragile; ask instead.
+            throw @"
+Python 3.9+ was not found. Install it with one of:
+  xcode-select --install          (Apple Command Line Tools; provides python3)
+  brew install python            (Homebrew)
+or set -Serial/-ToolRoot aside and re-run once python3 is on PATH.
+"@
+        }
     } else {
         Write-Host "Python: $py"
     }
@@ -329,12 +498,70 @@ function Ensure-Python {
     return $py
 }
 
+# Locate the Android SDK/NDK the provisioner builds with. Mirrors the search
+# order of android-env.mk / provision_portal.py: explicit env vars first, then
+# the standard per-user locations.
+function Get-AndroidSdkRoot {
+    foreach ($root in @($env:ANDROID_SDK_ROOT, $env:ANDROID_HOME, $SdkRoot)) {
+        if ($root -and (Test-Path -LiteralPath $root)) { return $root }
+    }
+    if (-not $script:OnWindows) {
+        $homeDir = [Environment]::GetFolderPath("UserProfile")
+        foreach ($cand in @("$homeDir/Library/Android/sdk", "$homeDir/Android/Sdk", "$homeDir/android-sdk")) {
+            if (Test-Path -LiteralPath $cand) { return $cand }
+        }
+    } else {
+        $cand = Join-Path $env:LOCALAPPDATA "Android\Sdk"
+        if (Test-Path -LiteralPath $cand) { return $cand }
+    }
+    return $null
+}
+
+function Test-AndroidBuildEnv {
+    # The provisioner needs these to build the exploit + uid1000 payloads
+    # (Phase 1 and Phase 3 run with -Rebuild; without it they only need the
+    # prebuilt artifacts). Report what is missing with actionable hints.
+    $sdk = Get-AndroidSdkRoot
+    if (-not $sdk) {
+        Write-Notice "Android SDK not found (looked in ANDROID_SDK_ROOT/ANDROID_HOME and the default per-user locations)."
+        Write-Notice "  Install it with Android Studio or: brew install --cask android-commandlinetools"
+        return $false
+    }
+    $ndk = if ($env:ANDROID_NDK_HOME) { $env:ANDROID_NDK_HOME }
+           elseif ($env:ANDROID_NDK_ROOT) { $env:ANDROID_NDK_ROOT }
+           else { Join-Path $sdk "ndk\28.2.13676358" }
+    $bt = if ($env:BUILD_TOOLS) { $env:BUILD_TOOLS } else { Join-Path $sdk "build-tools\37.0.0" }
+    $jar = if ($env:ANDROID_JAR) { $env:ANDROID_JAR } else { Join-Path $sdk "platforms\android-36\android.jar" }
+    $pre = if ($script:OnWindows) { "windows-x86_64" } elseif ($IsMacOS) { "darwin-x86_64" } else { "linux-x86_64" }
+    $cc = Join-Path $ndk ("toolchains\llvm\prebuilt\$pre\bin\aarch64-linux-android29-clang")
+    $missing = @()
+    foreach ($f in @($cc, (Join-Path $bt "aapt"), (Join-Path $bt "zipalign"), (Join-Path $bt "apksigner"), (Join-Path $bt "d8"), $jar)) {
+        if (-not (Test-Path -LiteralPath $f)) { $missing += $f }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Notice "Android build environment is incomplete; missing:"
+        foreach ($m in $missing) { Write-Notice "  $m" }
+        Write-Notice "  Install with: sdkmanager --install `"ndk;28.2.13676358`" `"build-tools;37.0.0`" `"platforms;android-36`""
+        return $false
+    }
+    Write-Host "SDK:    $sdk"
+    Write-Host "NDK:    $ndk"
+    # Export for the provisioner/make.
+    $env:ANDROID_SDK_ROOT = $sdk
+    if (-not $env:ANDROID_NDK_HOME) { $env:ANDROID_NDK_HOME = $ndk }
+    return $true
+}
+
 function Bootstrap-Deps {
     Write-Phase "Checking tools (adb, Java, Python, apksig)"
     Ensure-Adb
     Ensure-Java
     $script:PythonExe = Ensure-Python
     $null = Ensure-Apksig
+    Write-Phase "Checking Android SDK/NDK (needed to build the exploit payloads)"
+    if (-not (Test-AndroidBuildEnv)) {
+        throw "The Android SDK/NDK components required to build are missing (see above). Install them, or re-run a phase that already has its artifacts built."
+    }
     Write-Ok "tools ready"
 }
 
@@ -604,7 +831,7 @@ function Invoke-Phase2 {
     $candidates = @()
     if ($PlayDir) { $candidates += $PlayDir }
     $candidates += (Join-Path $PSScriptRoot "stack")
-    $candidates += "$env:USERPROFILE\Downloads\play"
+    $candidates += "$script:DownloadsDir\play"
     $stackDir = $candidates | Where-Object { (Get-NewestGms $_) } | Select-Object -First 1
     if (-not $stackDir) {
         $stackDir = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -664,9 +891,9 @@ function Invoke-Phase2 {
     if (Test-PackageInstalled "com.android.vending") {
         Write-Host "com.android.vending already installed; leaving it"
     } else {
-        $splits = Join-Path $env:TEMP "vending_splits"
+        $splits = Join-Path $script:TempDir "vending_splits"
         Remove-Item $splits -Recurse -Force -ErrorAction SilentlyContinue
-        $zip = Join-Path $env:TEMP "vending.zip"
+        $zip = Join-Path $script:TempDir "vending.zip"
         Copy-Item -LiteralPath $vending -Destination $zip -Force
         Expand-Archive -LiteralPath $zip -DestinationPath $splits -Force
         $parts = @(Join-Path $splits "base.apk")
@@ -784,9 +1011,11 @@ function Get-ApkSignerCert {
     # $ErrorActionPreference=Stop that would throw before we can read the output.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # java's -cp entries are separated by ';' on Windows and ':' elsewhere.
+    $cpSep = [IO.Path]::PathSeparator
     try {
         if (Test-Path -LiteralPath $class) {
-            $out = @(& $java -cp "$jar;$classDir" ExtractApkCert $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
+            $out = @(& $java -cp "$jar$cpSep$classDir" ExtractApkCert $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
         } elseif (Test-Path -LiteralPath $src) {
             $out = @(& $java -cp $jar $src $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
         } else {
@@ -828,8 +1057,9 @@ function Get-MessengerApk {
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($hitXapk) { return (Expand-MessengerXapk $hitXapk.FullName) }
     $apkeep = Join-Path $PSScriptRoot "messenger-patch\tools\apkeep.exe"
-    if (Test-Path -LiteralPath $apkeep) {
-        $dir = Join-Path $env:TEMP "portal-messenger-dl"
+    # apkeep.exe is a Windows PE binary; only try to run it on Windows.
+    if ($script:OnWindows -and (Test-Path -LiteralPath $apkeep)) {
+        $dir = Join-Path $script:TempDir "portal-messenger-dl"
         Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         Write-Notice "Downloading the newest Messenger via apkeep ..."
@@ -839,7 +1069,7 @@ function Get-MessengerApk {
         $xapk = Get-ChildItem $dir -Recurse -File -Filter "*.xapk" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($xapk) { return (Expand-MessengerXapk $xapk.FullName) }
     }
-    throw "No Messenger APK. Put a genuine com.facebook.orca APK in $MessengerDir, pass -MessengerApk <path>, or add messenger-patch\tools\apkeep.exe."
+    throw "No Messenger APK. Put a genuine com.facebook.orca APK (or .xapk) in $MessengerDir, or pass -MessengerApk <path>. (Automatic download via apkeep only works on Windows.)"
 }
 
 # Unpack an .xapk (a zip holding a base APK plus splits) and return its parts.
@@ -873,7 +1103,7 @@ function Set-PresenceMessengerTrust {
     $sdk = [int](Invoke-AdbQuiet shell getprop ro.build.version.sdk).Output
     $remote = (Invoke-AdbQuiet shell "ls /system/priv-app/aloha_presence_release/ | grep -i '\.apk'").Output.Trim()
     if (-not $remote) { throw "Could not locate the installed presence APK." }
-    $local = Join-Path $env:TEMP "portal-presence.apk"
+    $local = Join-Path $script:TempDir "portal-presence.apk"
     Invoke-Adb pull "/system/priv-app/aloha_presence_release/$remote" $local | Out-Null
     $hostCert = Get-ApkSignerCert $local $sdk
     Write-Host "presence cert  sha256=$($hostCert.Sha256.Substring(0,16))... hashCode=$(Get-SignatureHashCode $hostCert.Hex)"

@@ -29,7 +29,7 @@ $(KEYSTORE):
 	mkdir -p $(dir $(KEYSTORE))
 	keytool -genkeypair -keystore $(KEYSTORE) -storepass android \
 		-alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" \
-		-keyalg RSA -keysize 2048 -validity 10000
+		-keyalg RSA -keysize 2048 -validity 10000 || test -s $(KEYSTORE)
 	chmod 0600 $(KEYSTORE)
 
 clean:
