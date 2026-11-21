@@ -41,3 +41,6 @@ AGENTS.md
 # Pre-built outputs needed to run without -Rebuild
 !exploit/build/preload-portal-aloha-1041515800015050.so
 !exploit-sentinel/build/portal-exploit-sentinel.apk
+!uid1000-helper/build/portal-camera-led-watch-aloha
+!uid1000-helper/build/portal-uid1000-hook-aloha.bin
+!uid1000-helper/build/portal-uid1000-runtime.apk

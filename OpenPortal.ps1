@@ -163,12 +163,21 @@ function Read-YesNo {
     )
     while ($true) {
         Write-Host $Prompt -ForegroundColor Cyan
+        $key = ""
         if ([Console]::IsInputRedirected) {
-            $answer = Read-Host
-            $key = if ($answer) { $answer.Trim().ToUpperInvariant() } else { "" }
+            $line = [Console]::In.ReadLine()
+            if ($null -eq $line) { return $false }   # no more input: decline, don't hang
+            $key = $line.Trim().ToUpperInvariant()
         } else {
-            $key = [Console]::ReadKey($true).Key.ToString().ToUpperInvariant()
-            Write-Host $key
+            try {
+                $key = [Console]::ReadKey($true).Key.ToString().ToUpperInvariant()
+                Write-Host $key
+            } catch {
+                # No console (e.g. ISE or remoting): read a line instead.
+                $line = Read-Host
+                if (-not $line) { return $false }
+                $key = $line.Trim().ToUpperInvariant()
+            }
         }
         if ($key -eq "Y") { return $true }
         if ($key -eq "N") { return $false }
@@ -744,8 +753,9 @@ function Install-Apk {
 }
 
 # Meta's FacebookAppVerifier rejects every app not signed by Facebook. Disable it
-# (the verifier itself AND adb-install verification, which also defaults to on
-# after a factory reset) so installs go through. Harmless to re-run.
+# so installs go through: the framework verifier setting, adb-install
+# verification, and Meta's own verifier package (com.facebook.appverifier), which
+# gates app-initiated Play Store installs. Harmless to re-run.
 function Disable-AppVerifier {
     $cur = (Invoke-AdbQuiet shell settings get global package_verifier_enable).Output
     if ($cur -ne "0") {
@@ -757,6 +767,118 @@ function Disable-AppVerifier {
         Write-Host "disabling adb-install verification (was $adbcur)"
         Invoke-Adb shell settings put global verifier_verify_adb_installs 0 | Out-Null
     }
+    $disabled = (Invoke-AdbQuiet shell "pm list packages -d -u | grep com.facebook.appverifier").Output
+    if ($disabled -notmatch 'com\.facebook\.appverifier') {
+        Write-Host "disabling Meta's app verifier (com.facebook.appverifier)"
+        Invoke-Adb shell pm disable-user --user 0 com.facebook.appverifier | Out-Null
+    }
+}
+
+# What to do when the Portal is not reachable over ADB. The Portal does not keep
+# ADB on across reboots (Meta's ADB switch turns itself off at boot), so this is
+# common while the exploit is rebooting the device.
+function Write-AdbRecoveryHint {
+    Write-Host ""
+    Write-Notice "The Portal is not reachable over ADB. The Portal does not keep ADB enabled"
+    Write-Notice "across reboots, so after each reboot you may need to:"
+    Write-Notice "  1. On the Portal: Settings -> Debug -> ADB Enabled (turn it back on)."
+    Write-Notice "  2. Tap Allow if an 'Allow USB debugging?' prompt appears."
+    Write-Notice "  3. If it still will not reconnect, run:  adb -d tcpip 5555"
+    Write-Notice "Then re-run OpenPortal; it resumes where it left off."
+}
+
+# Wait until the Portal is connected AND finished booting (sys.boot_completed=1).
+# Returns $true when ready, $false on timeout. A device whose adbd is up but is
+# still booting would otherwise pass Resolve-Serial, then fail inside the exploit.
+function Wait-PortalReady {
+    param([int]$TimeoutSeconds = 120)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $toldUnauthorized = $false
+    while ($true) {
+        $state = (Invoke-AdbQuiet get-state).Output
+        if ($state -eq "device") {
+            if ((Invoke-AdbQuiet shell getprop sys.boot_completed).Output -eq "1") { return $true }
+        } elseif ($state -eq "unauthorized" -and -not $toldUnauthorized) {
+            Write-Notice "On the Portal's screen, tap 'Allow' on the 'Allow USB debugging?' prompt."
+            $toldUnauthorized = $true
+        }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds 3
+    }
+}
+
+# Run the provisioner, streaming its output and saving it to
+# <LogDir>\provisioner.log (so the log folder is never empty). Returns its exit code.
+function Invoke-Provisioner {
+    param([string[]]$PyArgs, [string]$LogDir)
+    $logFile = Join-Path $LogDir "provisioner.log"
+    # Write UTF-8 throughout (Tee-Object would mix encodings with a pre-written header).
+    $writer = New-Object System.IO.StreamWriter($logFile, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'   # native stderr must not become a terminating error
+    try {
+        $writer.WriteLine("# OpenPortal provisioner run $(Get-Date -Format o)")
+        & $script:PythonExe @PyArgs 2>&1 | ForEach-Object {
+            $line = "$_"
+            # Keep the provisioner's stderr (its banner and PROVISION_ERROR) red, as before.
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                Write-Host $line -ForegroundColor Red
+            } else {
+                Write-Host $line
+            }
+            $writer.WriteLine($line)
+        }
+    } finally {
+        $writer.Dispose()
+        $ErrorActionPreference = $prev
+    }
+    return $LASTEXITCODE
+}
+
+# The prebuilt files a --skip-build run needs. The provisioner builds them only
+# when it is NOT passed --skip-build, so a downloaded bundle has to contain them
+# all: the exploit and its sentinel, plus the UID-1000 helper, boot hook and
+# runtime APK that the wireless-ADB and permission-grant steps install. A bundle
+# that ships only the first two leaves those steps failing mid-run.
+function Assert-BuildOutputs {
+    $required = @(
+        (Join-Path $ToolRoot "exploit\build\preload-portal-aloha-1041515800015050.so"),
+        (Join-Path $ToolRoot "exploit-sentinel\build\portal-exploit-sentinel.apk"),
+        (Join-Path $ToolRoot "uid1000-helper\build\portal-camera-led-watch-aloha"),
+        (Join-Path $ToolRoot "uid1000-helper\build\portal-uid1000-hook-aloha.bin"),
+        (Join-Path $ToolRoot "uid1000-helper\build\portal-uid1000-runtime.apk")
+    )
+    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+    if ($missing.Count -gt 0) {
+        $list = ($missing | ForEach-Object { "    $_" }) -join [Environment]::NewLine
+        throw ("Missing prebuilt file(s) needed by this run:`n$list`n" +
+               "Run with -Rebuild so the provisioner builds them, or restore them from the release bundle.")
+    }
+}
+
+# The log folder for the phase that is running. Every phase gets a fresh one, and
+# any failure -- even one that happens before the provisioner starts -- is written
+# into it, so a failed run always leaves something to read.
+$script:LogDir = $null
+
+function New-LogDir {
+    $dir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $script:LogDir = $dir
+    Write-Host "Logs:          $dir"
+    return $dir
+}
+
+# Append an error to the current log folder (it is already on the console). Falls
+# back to a fresh folder if the failure happened before a phase made one.
+function Write-RunError {
+    param([string]$Message)
+    try {
+        if (-not $script:LogDir) { $null = New-LogDir }
+        $line = "{0}  ERROR  {1}" -f (Get-Date -Format o), $Message
+        Add-Content -LiteralPath (Join-Path $script:LogDir 'error.log') -Value $line
+        Write-Host "See $($script:LogDir)\error.log" -ForegroundColor DarkGray
+    } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -770,6 +892,13 @@ function Invoke-Phase1 {
 
     Resolve-Serial
     Write-Host "Device serial: $($script:Serial)"
+
+    # Pre-flight: the exploit's first act is to connect to the Portal. Make sure
+    # it is connected AND finished booting, with a clear message if it is not.
+    if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
+        Write-AdbRecoveryHint
+        throw "The Portal is not ready (ADB not connected, or still booting)."
+    }
     Write-Host "Model:         $(Invoke-Adb shell getprop ro.product.model)"
     Write-Host "Fingerprint:   $(Invoke-Adb shell getprop ro.build.fingerprint)"
 
@@ -780,33 +909,30 @@ function Invoke-Phase1 {
 
     # The provisioner builds these itself unless it is passed --skip-build, so
     # only require them up front for a --skip-build run.
-    if (-not $Rebuild) {
-        $so = Join-Path $ToolRoot "exploit\build\preload-portal-aloha-1041515800015050.so"
-        $sentinel = Join-Path $ToolRoot "exploit-sentinel\build\portal-exploit-sentinel.apk"
-        foreach ($f in @($so, $sentinel)) {
-            if (-not (Test-Path -LiteralPath $f)) {
-                throw "Missing build output: $f (run with -Rebuild so the provisioner builds it, or build it first)"
-            }
-        }
-    }
+    if (-not $Rebuild) { Assert-BuildOutputs }
 
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-    Write-Host "Logs:          $logDir"
+    $logDir = $script:LogDir
     Write-Notice "This runs the kernel exploit and reboots the Portal a few times. Keep USB connected."
 
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--persistent-wireless-adb",
                 "--attempts", $Attempts, "--log-dir", $logDir)
     if (-not $Rebuild) { $pyArgs += "--skip-build" }
 
-    & $script:PythonExe @pyArgs
-    if ($LASTEXITCODE -ne 0) { throw "Provisioner exited with code $LASTEXITCODE (see $logDir)" }
+    $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
+    if ($code -ne 0) {
+        Write-AdbRecoveryHint
+        throw "Provisioner exited with code $code (see $logDir\provisioner.log)"
+    }
 
     # Re-read state after the provisioner's reboots. Give the channel time to
     # come back (wlan0 IP + adbd's TCP listener) rather than failing instantly.
     $script:PortalIp = $null
-    Resolve-Serial
+    if (-not (Wait-PortalReady -TimeoutSeconds 180)) {
+        Write-AdbRecoveryHint
+        throw "Phase 1 did not verify: the Portal did not come back after the exploit."
+    }
     if (-not (Wait-RecoveryChannel -TimeoutSeconds 180)) {
+        Write-AdbRecoveryHint
         throw ("Phase 1 did not verify: persist.adb.tcp.port=5555 / TCP shell not working. " +
                "Make sure the Portal is connected to Wi-Fi (the TCP channel needs a wlan0 IP).")
     }
@@ -819,6 +945,10 @@ function Invoke-Phase1 {
 function Invoke-Phase2 {
     Write-Phase "Phase 2 - install the real Google stack (no stub)"
     Resolve-Serial
+    if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
+        Write-AdbRecoveryHint
+        throw "The Portal is not ready (ADB not connected, or still booting)."
+    }
 
     # The Google stack is not signed by Facebook, so Meta's verifier would reject
     # these adb installs on a fresh device. Disable it before installing.
@@ -930,15 +1060,21 @@ function Invoke-Phase3 {
     $provisioner = Join-Path $ToolRoot "tools\provision_portal.py"
     if (-not (Test-Path $provisioner)) { throw "Provisioner not found: $provisioner" }
 
+    # Phase 3's action installs the same UID-1000 helper and boot hook the exploit
+    # carries, so a --skip-build run needs those prebuilt files too.
+    if (-not $Rebuild) { Assert-BuildOutputs }
+
+    if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
+        Write-AdbRecoveryHint
+        throw "The Portal is not ready (ADB not connected, or still booting)."
+    }
     if (Test-RecoveryChannel) {
         Write-Ok "Recovery channel verified (persist.adb.tcp.port=5555, TCP shell works)."
     } else {
         Write-Notice "TCP 5555 recovery channel is NOT working; a boot loop would need a factory reset."
     }
 
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-    Write-Host "Logs:          $logDir"
+    $logDir = $script:LogDir
     Write-Host "Grant cert of: $GrantPackages"
     Write-Notice "This injects Google's cert as a PERMISSION-capable past signature of the framework, then reboots."
 
@@ -947,15 +1083,19 @@ function Invoke-Phase3 {
                 "--attempts", $Attempts, "--log-dir", $logDir)
     if (-not $Rebuild) { $pyArgs += "--skip-build" }
 
-    & $script:PythonExe @pyArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw ("Provisioner exited with code $LASTEXITCODE (see $logDir). If the Portal is " +
+    $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
+    if ($code -ne 0) {
+        Write-AdbRecoveryHint
+        throw ("Provisioner exited with code $code (see $logDir\provisioner.log). If the Portal is " +
                "boot-looping, recover with: adb connect <ip>:5555 ; " +
                "`"$script:PythonExe`" `"$provisioner`" --serial <ip>:5555 --permission-grants-restore --skip-build")
     }
 
     $script:PortalIp = $null
-    Resolve-Serial
+    if (-not (Wait-PortalReady -TimeoutSeconds 180)) {
+        Write-AdbRecoveryHint
+        throw "Phase 3 did not verify: the Portal did not come back after the exploit."
+    }
     $boot = (Invoke-AdbQuiet shell getprop sys.boot_completed).Output
     if ($boot -ne "1") { throw "Phase 3 did not verify: sys.boot_completed=$boot" }
     Write-Host (Invoke-AdbQuiet shell "dumpsys package android | grep -i 'past signatures'").Output
@@ -969,6 +1109,10 @@ function Invoke-Phase3 {
 function Invoke-Phase4 {
     Write-Phase "Phase 4 - allow Play Store installs + verify Google Services"
     Resolve-Serial
+    if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
+        Write-AdbRecoveryHint
+        throw "The Portal is not ready (ADB not connected, or still booting)."
+    }
 
     # Meta's FacebookAppVerifier rejects every app not signed by Facebook, so the
     # Play Store (and Aurora) cannot install anything until Android is told to
@@ -1110,8 +1254,7 @@ function Set-PresenceMessengerTrust {
 
     $provisioner = Join-Path $ToolRoot "tools\provision_portal.py"
     if (-not (Test-Path $provisioner)) { throw "Provisioner not found: $provisioner" }
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $logDir = $script:LogDir
     Write-Notice "Injecting presence's own cert first, then the Messenger cert."
     $env:PORTAL_SKIP_CLEAN_BOOT = "1"
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--permission-grants",
@@ -1120,10 +1263,20 @@ function Set-PresenceMessengerTrust {
                 "--permission-grant-cert", "$($hostCert.Hex),$ClientCertHex",
                 "--attempts", $Attempts, "--log-dir", $logDir)
     if (-not $Rebuild) { $pyArgs += "--skip-build" }
-    & $script:PythonExe @pyArgs
-    if ($LASTEXITCODE -ne 0) { throw "Provisioner exited with code $LASTEXITCODE (see $logDir)" }
+    try {
+        $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
+    } finally {
+        Remove-Item Env:\PORTAL_SKIP_CLEAN_BOOT -ErrorAction SilentlyContinue
+    }
+    if ($code -ne 0) {
+        Write-AdbRecoveryHint
+        throw "Provisioner exited with code $code (see $logDir\provisioner.log)"
+    }
     $script:PortalIp = $null
-    Resolve-Serial
+    if (-not (Wait-PortalReady -TimeoutSeconds 180)) {
+        Write-AdbRecoveryHint
+        throw "The Portal did not come back after the Messenger patch."
+    }
     return $hostCert
 }
 
@@ -1131,12 +1284,18 @@ function Invoke-Phase5 {
     Write-Phase "Phase 5 - genuine Messenger (no rename/re-sign workaround)"
     Resolve-Serial
 
+    if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
+        Write-AdbRecoveryHint
+        throw "The Portal is not ready (ADB not connected, or still booting)."
+    }
+
     $knownHash = Get-SignatureHashCode $script:MessengerCertHex
     Write-Host "Messenger cert (known) hashCode=$knownHash"
 
-    # Always apply the patch.  presence's OWN cert goes first (so its identity is
-    # unchanged and every other Facebook app still trusts it), then the Messenger
-    # cert (so Android's duplicate-permission check accepts the install).
+    # Apply the patch (unless presence already trusts the cert).  presence's OWN
+    # cert goes first (so its identity is unchanged and every other Facebook app
+    # still trusts it), then the Messenger cert (so Android's duplicate-permission
+    # check accepts the install).  This runs regardless of the install answer below.
     $presenceSigs = (Invoke-AdbQuiet shell "dumpsys package com.facebook.alohaservices.presence | grep -i 'past signatures'").Output
     if ($presenceSigs -match [regex]::Escape($knownHash)) {
         Write-Ok "presence already trusts the Messenger cert; skipping the injection."
@@ -1230,6 +1389,7 @@ try {
     Bootstrap-Deps
     foreach ($ph in $PhaseCatalogue) {
         if ($wanted.ContainsKey($ph.n)) {
+            $null = New-LogDir
             & $ph.run
             $ran += $ph.n
         } else {
@@ -1240,6 +1400,7 @@ try {
 }
 catch {
     Write-Bad $_.Exception.Message
+    Write-RunError $_.Exception.Message
     Write-Host "PORTAL_PROVISION_FAILED" -ForegroundColor Red
     exit 1
 }

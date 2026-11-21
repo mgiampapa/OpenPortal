@@ -6641,7 +6641,7 @@ class PortalProvisioner:
         )
 
     def provision(self) -> None:
-        self.connect(wait_seconds=30)
+        self.connect(wait_seconds=600)
         resumed_pending = False
         if self.status_only:
             self.verify_target(require_supported=False)
@@ -6788,7 +6788,7 @@ class PortalProvisioner:
                 skip_build=self.skip_build,
                 wireless_adb_only=True,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             persistent_port = self.adb_run(
                 ["shell", "getprop", persistent_property],
@@ -6826,7 +6826,7 @@ class PortalProvisioner:
                 skip_build=self.skip_build,
                 adb_framework_only=True,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.adb_framework_boot_configured = (
                 self.adb_framework_boot_preflight()
@@ -6859,7 +6859,7 @@ class PortalProvisioner:
                 audio=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.audio_already_configured = self.audio_preflight()
             if not self.audio_already_configured:
@@ -6900,7 +6900,7 @@ class PortalProvisioner:
                 device_owner=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             already_owner = self.device_owner_preflight()
             if not already_owner:
@@ -6937,7 +6937,7 @@ class PortalProvisioner:
                 disable_updates=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.ota_already_configured = self.ota_preflight()
             if not self.ota_already_configured:
@@ -6992,7 +6992,7 @@ class PortalProvisioner:
                     skip_build=self.skip_build,
                     meta_accounts_auth_only=True,
                 ).provision()
-                self.connect(wait_seconds=30)
+                self.connect(wait_seconds=600)
                 self.verify_target()
             local_clean = (
                 self.adb_run(
@@ -7017,7 +7017,7 @@ class PortalProvisioner:
                     skip_build=self.skip_build,
                     meta_accounts_local_only=True,
                 ).provision()
-                self.connect(wait_seconds=30)
+                self.connect(wait_seconds=600)
                 self.verify_target()
             finalize_logs = self.log_dir / "meta-accounts-finalize-bootstrap"
             finalize_logs.mkdir(parents=True, exist_ok=True)
@@ -7034,7 +7034,7 @@ class PortalProvisioner:
                 skip_build=self.skip_build,
                 meta_accounts_finalize_only=True,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             already_meta_clean = self.meta_accounts_preflight()
             self.meta_accounts_already_clean = already_meta_clean
@@ -7064,7 +7064,7 @@ class PortalProvisioner:
                 remove_meta_accounts=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             already_meta_clean = self.meta_accounts_preflight()
             self.meta_accounts_already_clean = already_meta_clean
@@ -7111,7 +7111,7 @@ class PortalProvisioner:
                 block_remote_wipe=self.block_remote_wipe,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.debloat_already_configured = self.debloat_preflight()
             if not self.debloat_already_configured:
@@ -7155,7 +7155,7 @@ class PortalProvisioner:
                 block_remote_wipe=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.remote_wipe_already_configured = self.remote_wipe_preflight()
             if not self.remote_wipe_already_configured:
@@ -7199,7 +7199,7 @@ class PortalProvisioner:
                 optimize_presence=True,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.presence_already_configured = self.presence_preflight()
             if not self.presence_already_configured:
@@ -7252,7 +7252,7 @@ class PortalProvisioner:
                 presence_fps_cap=self.presence_fps_cap,
                 skip_build=self.skip_build,
             ).provision()
-            self.connect(wait_seconds=30)
+            self.connect(wait_seconds=600)
             self.verify_target()
             self.presence_fps_already_configured = (
                 self.presence_fps_preflight()
